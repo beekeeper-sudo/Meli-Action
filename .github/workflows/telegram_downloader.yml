@@ -1,14 +1,14 @@
-name: تلگرام دانلودر (چند لینک همزمان)
+name: تلگرام دانلودر (چند لینک، سریع)
 
 on:
   workflow_dispatch:
     inputs:
       telegram_links:
-        description: '🔗 لینک‌های پست تلگرام (حداکثر ۱۰ لینک، با خط جدید، کاما یا فاصله جدا کنید)'
+        description: '🔗 لینک‌های تلگرام (حداکثر ۱۰ عدد، جدا با کاما، فاصله یا خط جدید)'
         required: true
         type: string
       split_threshold_mb:
-        description: '📦 حداکثر حجم هر بخش به مگابایت (0 یعنی بدون تقسیم)'
+        description: '📦 حداکثر حجم قطعه (MB) – 0 = بدون تقسیم'
         required: false
         type: number
         default: 90
@@ -18,7 +18,7 @@ on:
         type: string
         default: ''
       custom_filename:
-        description: '✏️ نام فایل دلخواه (فقط برای تک لینک؛ پسوند اصلی حفظ می‌شود مگر اینکه خودتان پسوند بدهید)'
+        description: '✏️ نام فایل دلخواه (فقط برای یک فایل؛ پسوند حفظ می‌شود)'
         required: false
         type: string
         default: ''
@@ -33,31 +33,33 @@ jobs:
       contents: write
 
     steps:
-      - name: 📂 دریافت مخزن
+      - name: 📂 دریافت فقط شاخهٔ downloads (سریع)
         uses: actions/checkout@v5
         with:
+          ref: downloads                     # شاخهٔ سبک مخصوص فایل‌ها
           token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1                     # فقط آخرین commit بدون تاریخچه
 
-      - name: 🔧 نصب ابزارهای سیستمی
+      - name: 🔧 نصب ابزارهای ضروری
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl jq zip unzip openssl python3 python3-pip
+          sudo apt-get install -y zip unzip python3 python3-pip
 
       - name: 🐍 نصب کتابخانه‌های پایتون
         run: pip3 install requests
 
-      - name: 📝 ساخت اسکریپت جامع
+      - name: 📝 ساخت اسکریپت اصلاح‌شده
         run: |
           cat > telegram_downloader.py << 'EOF'
           #!/usr/bin/env python3
-          import os, sys, time, shlex, json
+          import os, sys, time, json, uuid
           from pathlib import Path
           from concurrent.futures import ThreadPoolExecutor, as_completed
           import requests
           import re
+          import subprocess
 
           def parse_links(raw_text):
-              """تبدیل ورودی کاربر به لیست لینک‌های معتبر (حداکثر ۱۰ عدد)"""
               text = raw_text.replace(',', '\n').replace(' ', '\n')
               lines = text.splitlines()
               links = []
@@ -68,10 +70,8 @@ jobs:
                   if line.startswith('http'):
                       links.append(line)
                   else:
-                      # اگر قالب t.me باشد
                       if 't.me/' in line:
                           links.append('https://' + line.lstrip('/'))
-              # حذف موارد تکراری با حفظ ترتیب
               seen = set()
               unique_links = []
               for l in links:
@@ -79,16 +79,15 @@ jobs:
                       seen.add(l)
                       unique_links.append(l)
               if len(unique_links) > 10:
-                  print(f"⚠️ بیش از ۱۰ لینک تشخیص داده شد. فقط ۱۰ لینک اول پردازش می‌شود.")
+                  print(f"⚠️ بیش از ۱۰ لینک تحلیل شد. فقط ۱۰ لینک اول بررسی می‌شوند.")
                   unique_links = unique_links[:10]
               print(f"✅ {len(unique_links)} لینک معتبر شناسایی شد.")
               return unique_links
 
           def download_with_resume(url, dest, headers, max_retries=10, chunk_size=64*1024):
-              """دانلود فایل با پشتیبانی از ادامه (resume)"""
               dest = Path(dest)
               dest.parent.mkdir(parents=True, exist_ok=True)
-              temp = dest.with_suffix(dest.suffix + ".partial")
+              temp = dest.with_name(f".{uuid.uuid4().hex}.partial")
               downloaded = temp.stat().st_size if temp.exists() else 0
               sess = requests.Session()
               sess.headers.update(headers)
@@ -112,7 +111,7 @@ jobs:
                                       bar = '█' * int(40 * downloaded // total) + '░' * (40 - int(40 * downloaded // total))
                                       print(f"\rپیشرفت: |{bar}| {pct:.1f}% ({downloaded}/{total} بایت)", end='', flush=True)
                       print()
-                      temp.rename(dest)
+                      temp.replace(dest)
                       return True, dest.stat().st_size
                   except (requests.exceptions.ChunkedEncodingError,
                           requests.exceptions.ConnectionError,
@@ -121,12 +120,15 @@ jobs:
                       time.sleep(2 ** attempt)
                   except Exception as e:
                       print(f"\n❌ خطای مرگبار: {e}")
+                      if temp.exists():
+                          temp.unlink()
                       return False, 0
               print("\n❌ تعداد تلاش‌ها به پایان رسید.")
+              if temp.exists():
+                  temp.unlink()
               return False, 0
 
           def fetch_direct_link(telegram_link, headers):
-              """لینک مستقیم و نام فایل را از API دریافت می‌کند"""
               api = "https://telegramdownloader.net/proxy.php"
               data = {"telegram_link": telegram_link}
               try:
@@ -142,21 +144,17 @@ jobs:
                   return None, None, str(e)
 
           def sanitize_name(name):
-              """تبدیل نام فایل به فرم امن (بدون کراکترهای غیرمجاز)"""
-              # اگر نویسه غیر ASCII وجود داشت، یک نام هگز تصادفی بسازیم
               if not name.isascii():
                   rand = os.urandom(8).hex()
                   ext = Path(name).suffix
                   if not ext:
                       ext = ".bin"
                   return f"{rand}{ext}"
-              # حذف کراکترهای مشکل‌ساز
               clean = re.sub(r'[^a-zA-Z0-9._-]', '_', name)
               clean = re.sub(r'__+', '_', clean)
               return clean
 
           def process_one_link(link, base_dir, session_headers):
-              """دانلود یک لینک، برگرداندن مسیر فایل نهایی و حجم"""
               print(f"\n🔗 دریافت اطلاعات {link}")
               url, fname, err = fetch_direct_link(link, session_headers)
               if err:
@@ -164,11 +162,17 @@ jobs:
                   return None, 0, err
               print(f"📁 نام اصلی: {fname}")
               dest = base_dir / fname
+              counter = 1
+              orig_stem = dest.stem
+              orig_suffix = dest.suffix
+              while dest.exists():
+                  dest = base_dir / f"{orig_stem}_{counter}{orig_suffix}"
+                  counter += 1
               print(f"🚀 شروع دانلود...")
               success, size = download_with_resume(url, dest, session_headers)
               if not success:
                   return None, 0, "دانلود ناموفق"
-              print(f"✅ دانلود کامل: {fname} ({size/1e6:.2f} MB)")
+              print(f"✅ دانلود کامل: {dest.name} ({size/1e6:.2f} MB)")
               return dest, size, None
 
           def main():
@@ -192,7 +196,6 @@ jobs:
 
               headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
-              # دانلود همزمان
               results = []
               with ThreadPoolExecutor(max_workers=10) as executor:
                   futures = {executor.submit(process_one_link, link, base, headers): link for link in links}
@@ -211,12 +214,9 @@ jobs:
                   print("❌ هیچ فایلی با موفقیت دانلود نشد.")
                   sys.exit(1)
 
-              # اعمال نام سفارشی (فقط اگر یک لینک موفق باشد)
               if custom_filename and len(results) == 1:
                   dest, size = results[0]
-                  original = dest.name
                   ext = dest.suffix
-                  # اگر نام سفارشی پسوند نداشت، پسوند اصلی را اضافه کن
                   if not Path(custom_filename).suffix and ext:
                       new_name = custom_filename + ext
                   else:
@@ -228,7 +228,6 @@ jobs:
               elif custom_filename and len(results) > 1:
                   print("⚠️ نام سفارشی تنها برای یک فایل اعمال می‌شود. درخواست نادیده گرفته شد.")
 
-              # پاک‌سازی نام‌ها (sanitize)
               renamed = []
               for dest, size in results:
                   safe_name = sanitize_name(dest.name)
@@ -240,20 +239,15 @@ jobs:
                   else:
                       renamed.append((dest, size))
 
-              # تقسیم فایل‌ها در صورت نیاز
               final_files = []
               for fpath, size in renamed:
                   if split_thresh_mb > 0 and size > split_thresh_mb * 1024 * 1024:
                       print(f"✂️ در حال تقسیم فایل {fpath.name} (حجم: {size/1e6:.1f}MB)")
-                      safe_name = fpath.stem  # نام بدون پسوند
-                      # zip با split
                       zip_base = fpath.with_suffix(".zip")
-                      cmd = f"zip -s {split_thresh_mb}m \"{zip_base}\" -j \"{fpath}\""
+                      cmd = f"zip -s {split_thresh_mb}m \"{zip_base.name}\" -j \"{fpath.name}\""
                       print(f"   اجرای: {cmd}")
-                      import subprocess
                       subprocess.run(cmd, shell=True, check=True, cwd=fpath.parent)
-                      fpath.unlink()  # حذف فایل اصلی
-                      # لیست بخش‌های ایجادشده
+                      fpath.unlink()
                       parts = sorted(fpath.parent.glob(f"{zip_base.stem}.z*")) + [zip_base]
                       for p in parts:
                           final_files.append(p)
@@ -261,7 +255,6 @@ jobs:
                   else:
                       final_files.append(fpath)
 
-              # ذخیره اطلاعات نهایی (اختیاری)
               info = [{"file": str(f.relative_to(Path("downloads"))), "size": f.stat().st_size} for f in final_files]
               with open(base / ".download_results.json", "w") as f:
                   json.dump(info, f, indent=2)
@@ -284,7 +277,7 @@ jobs:
           export CUSTOM_FILENAME="${{ github.event.inputs.custom_filename }}"
           python3 telegram_downloader.py
 
-      - name: 📤 ارسال فایل‌ها به مخزن
+      - name: 📤 ارسال فایل‌ها به شاخهٔ downloads
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -294,7 +287,6 @@ jobs:
             exit 1
           fi
 
-          # اضافه کردن همه فایل‌های جدید به‌جز partial و فایل‌های متا
           find downloads -type f ! -name "*.partial" ! -name ".download_results.json" -exec git add {} \;
 
           if git diff --cached --quiet; then
@@ -305,7 +297,7 @@ jobs:
           git commit -m "Add downloaded files [skip ci]"
 
           for attempt in 1 2 3; do
-            if git push origin main 2>&1; then
+            if git push origin downloads 2>&1; then
               echo "   ✅ بارگذاری موفق"
               break
             else
